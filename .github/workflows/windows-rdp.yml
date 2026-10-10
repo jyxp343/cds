@@ -1,111 +1,118 @@
 name: Windows Cloud RDP
 
-
-
 on:
-
   workflow_dispatch:
 
-
-
 jobs:
-
   build:
-
     runs-on: windows-latest
-
     timeout-minutes: 360
 
-
-
     steps:
-
       - name: 1. Enable Remote Desktop & Firewall
-
+        shell: pwsh
         run: |
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
-
-
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
       - name: 2. Create Admin Account
-
-        run: |
-
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-
-          New-LocalUser -Name "NvdAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-
-          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin" -ErrorAction SilentlyContinue
-
-          net user runneradmin P@ssw0rd1qazXSW@#
-
-
-
-      - name: 3. Install & Connect Tailscale VPN
-
+        shell: pwsh
         env:
-
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:ADMIN_PASSWORD)) {
+            throw "ADMIN_PASSWORD secret is missing"
+          }
 
-          Download and install Tailscale silently
+          $Password = ConvertTo-SecureString $env:ADMIN_PASSWORD -AsPlainText -Force
 
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          if (Get-LocalUser -Name 'NvdAdmin' -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name 'NvdAdmin' -Password $Password
+          } else {
+            New-LocalUser -Name 'NvdAdmin' -Password $Password -PasswordNeverExpires
+          }
 
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Add-LocalGroupMember -Group 'Administrators' -Member 'NvdAdmin' -ErrorAction SilentlyContinue
 
-
-
-          Connect to Tailscale network
-
-          Start-Sleep -Seconds 5
-
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-
-
-
-          Start-Sleep -Seconds 8
-
-
-
-           Get Tailscale IP
-
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-
-
-
-          Write-Host ""
-
-          Write-Host "==========================================" -ForegroundColor Green
-
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-
-          Write-Host "==========================================" -ForegroundColor Green
-
-
-
-      - name: 4. Keep Server Alive (48 Hours)
-
+      - name: 3. Install Tailscale
+        shell: pwsh
         run: |
+          $Installer = Join-Path $env:TEMP 'tailscale.msi'
+
+          Invoke-WebRequest 
+            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' 
+            -OutFile $Installer
+
+          $Process = Start-Process msiexec.exe 
+            -ArgumentList @('/i', ""$Installer"", '/quiet', '/norestart') 
+            -Wait -PassThru
+
+          if ($Process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($Process.ExitCode)"
+          }
+
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            throw "Tailscale executable not found"
+          }
+
+      - name: 4. Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing"
+          }
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $Tailscale up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to establish Tailscale connection"
+          }
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+            $result = & $Tailscale ip -4
+            if ($LASTEXITCODE -eq 0 -and $result) {
+              $tsIP = ($result | Select-Object -First 1).ToString().Trim()
+            }
+
+            if (-not $tsIP) {
+              Start-Sleep -Seconds 5
+            }
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            throw "Tailscale IP not assigned"
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP assigned successfully"
+
+      - name: 5. Verify RDP Service
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $rdp = Get-Service -Name TermService
+          Write-Host "Remote Desktop service status: $($rdp.Status)"
+
+          if ($rdp.Status -ne 'Running') {
+            Start-Service -Name TermService
+          }
+
+      - name: 6. Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale connection established."
+          Write-Host "Runner lifetime is subject to GitHub Actions limits."
 
           for ($i = 1; $i -le 2880; $i++) {
-
-              Start-Sleep -Seconds 60
-
-              Write-Host "[$i/2880] Server running..."
-
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/2880] Job running..."
           }
